@@ -46,13 +46,15 @@ def generate_gradcam(
             "Could not find a Conv2D layer in the model or any nested sub-model."
         )
     logger.info(
-        "Grad-CAM using conv layer '%s' (output shape: %s)",
+        "Grad-CAM using conv layer '%s' (output shape: %s) inside model '%s'",
         conv_layer.name,
         conv_layer.output_shape,
+        containing_model.name,
     )
 
     # Build a model that outputs [conv_output, predictions]
     grad_model = _build_grad_model(model, conv_layer, containing_model)
+    logger.info("Grad-CAM model built successfully")
 
     # Compute gradients of the predicted class w.r.t. the conv output
     with tf.GradientTape() as tape:
@@ -60,6 +62,12 @@ def generate_gradcam(
         loss = predictions[0][predicted_class_index]
 
     grads = tape.gradient(loss, conv_output)
+    if grads is None:
+        raise RuntimeError(
+            "Gradients are None — could not compute gradients of the predicted "
+            "class w.r.t. the conv layer output."
+        )
+
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2)).numpy()
     conv_output = conv_output[0].numpy()
 
@@ -114,27 +122,16 @@ def _build_grad_model(outer_model, conv_layer, containing_model):
     """
     Build a Keras model that outputs [conv_layer_output, predictions].
 
-    Handles the case where the conv layer is inside a nested sub-model
-    (e.g. MobileNetV2 inside a Sequential model) by replaying the outer
-    model's layers up to the sub-model, then branching.
+    Instead of extracting intermediate tensors (layer.output) from the
+    loaded model's graph — which fails because those tensors are already
+    bound to the original model — this function creates a fresh Input
+    and calls each layer on it sequentially. The layers share the same
+    trained weights but build new graph connections, which is the
+    correct way to construct a Grad-CAM model from a loaded .keras file.
     """
     import tensorflow as tf
 
-    if containing_model is outer_model:
-        # Simple case: conv layer is directly in the outer model
-        return tf.keras.Model(
-            inputs=outer_model.inputs,
-            outputs=[conv_layer.output, outer_model.output],
-        )
-
-    # Complex case: conv layer is in a nested sub-model.
-    # Build a sub-model from the containing model's input to the conv layer.
-    conv_submodel = tf.keras.Model(
-        inputs=containing_model.input,
-        outputs=conv_layer.output,
-    )
-
-    # Find the position of the containing model in the outer model.
+    # Find the position of the containing sub-model in the outer model.
     sub_model_idx = None
     for i, layer in enumerate(outer_model.layers):
         if layer is containing_model:
@@ -147,17 +144,48 @@ def _build_grad_model(outer_model, conv_layer, containing_model):
             "in the outer model."
         )
 
-    # Build a new functional model by replaying the outer layers.
+    # Find the index of the conv layer within the containing model.
+    conv_idx = None
+    for i, layer in enumerate(containing_model.layers):
+        if layer is conv_layer:
+            conv_idx = i
+            break
+
+    if conv_idx is None:
+        raise RuntimeError(
+            "Could not find the conv layer in the containing model."
+        )
+
+    logger.info(
+        "Building grad model: sub_model at index %d, conv layer '%s' at "
+        "index %d within sub-model",
+        sub_model_idx,
+        conv_layer.name,
+        conv_idx,
+    )
+
+    # Create a fresh input tensor
     new_input = tf.keras.Input(shape=outer_model.input_shape[1:])
+
+    # Apply layers before the sub-model (augmentation, rescaling, etc.)
     x = new_input
-    # Run through layers before the sub-model (augmentation, rescaling, etc.)
     for i in range(sub_model_idx):
         x = outer_model.layers[i](x)
-    # Branch 1: conv output through the sub-model up to the conv layer
-    conv_out = conv_submodel(x)
-    # Branch 2: full predictions through the sub-model and remaining layers
-    x_full = containing_model(x)
-    for i in range(sub_model_idx + 1, len(outer_model.layers)):
-        x_full = outer_model.layers[i](x_full)
 
-    return tf.keras.Model(inputs=new_input, outputs=[conv_out, x_full])
+    # Branch 1: call the sub-model's layers up to and including the conv
+    # layer to get the convolutional feature map.
+    conv_x = x
+    for i in range(conv_idx + 1):
+        conv_x = containing_model.layers[i](conv_x)
+    conv_out = conv_x
+
+    # Branch 2: call all of the sub-model's layers for the full feature
+    # output, then apply the remaining outer model layers (global
+    # pooling, dropout, dense, etc.) to get final predictions.
+    full_x = x
+    for layer in containing_model.layers:
+        full_x = layer(full_x)
+    for i in range(sub_model_idx + 1, len(outer_model.layers)):
+        full_x = outer_model.layers[i](full_x)
+
+    return tf.keras.Model(inputs=new_input, outputs=[conv_out, full_x])
